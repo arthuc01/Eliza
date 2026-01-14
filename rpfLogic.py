@@ -473,7 +473,7 @@ class RpfCalculator:
             seen = set()
             filtered = []
             for entry in pairs:
-                key = (entry['atom1'], entry['atom2'])
+                key = (tuple(entry['atom1']), tuple(entry['atom2']))
                 if key not in seen:
                     seen.add(key)
                     filtered.append(entry)
