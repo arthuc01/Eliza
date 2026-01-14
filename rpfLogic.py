@@ -498,7 +498,7 @@ class RpfCalculator:
                 atom = entry.get(atom_key)
                 shift = entry.get(shift_key)
                 if atom and shift is not None:
-                    key = atom[:3]  # Residue ID
+                key = tuple(atom[:3])  # Residue ID
                     grouped[key].append((entry, atom[3], shift))  # (entry, atomName, shift)
 
             filtered = []
