@@ -50,6 +50,7 @@ from scipy.spatial import KDTree
 
 
 class RpfCalculator:
+    NOE_POWER = -6  # For distance^-6 weighting
     # This dictionary says how different numbers of 13C, 15N bound
     # dimensions limits which protons would be visible in a spectrum
     # given 13C or 15N connectivity
@@ -67,7 +68,9 @@ class RpfCalculator:
 
     def __init__(self, project: Project, pdb_path: str, peak_list_pids: list,
                  chemical_shift_pid: str, distance_threshold: float = 4.8, prochiral_tolerance: float =0.04,
-                 h_tolerance: float =0.04, c_tolerance: float =0.3, n_tolerance: float =0.3):
+                 h_tolerance: float =0.04, c_tolerance: float =0.3, n_tolerance: float =0.3,
+                 diagonal_tolerance: float = 0.3, aliasing: bool = True):
+        # Initialize configuration and storage for RPF calculations.
         self.project = project
         self.pdb_path = pdb_path
         self.peak_list_pids = peak_list_pids
@@ -77,6 +80,8 @@ class RpfCalculator:
         self.h_tolerance = h_tolerance
         self.c_tolerance = c_tolerance
         self.n_tolerance = n_tolerance
+        self.diagonal_tolerance = diagonal_tolerance
+        self.aliasing = aliasing
         # Data storage
 
         self.proton_dists_conn = {}
@@ -101,9 +106,11 @@ class RpfCalculator:
         self.syntheticPeaks = {}
 
     def getPeakList_objects(self):
+        # Resolve peak list PIDs into objects.
         return [self.project.getByPid(pid) for pid in self.peak_list_pids]
 
     def _get_atom_context(self, atom1):
+        # Identify the bonded heavy atom element for a given proton.
         """Get H atom context from structure"""
         model = self.ensembleModels[0]
         ns = NeighborSearch(list(model.get_atoms()))
@@ -166,12 +173,12 @@ class RpfCalculator:
     #
     #     return connections, peak_assignments
 
-    def get_ambig_noe_conn(self, shift_pairs, peak_df, tol_dict, diagonal_tol=0.3):
+    def get_ambig_noe_conn(self, shift_pairs, peak_df, tol_dict, spectrum, diagonal_tol=0.3, aliasing=False):
         """
         Enhanced ambiguous NOE peak–resonance mapping that works for 2D/3D/4D:
-          • Always uses the first two dimensions (F1, F2) as the homonuclear NOE axes.
-          • Builds a KDTree over (F1_shift, F2_shift) from shift_pairs.
-          • For each experimental peak, uses (position_F1, position_F2) to find all
+          • Uses the first two 1H dimensions as the homonuclear NOE axes.
+          • Builds a KDTree over those two 1H shifts from shift_pairs.
+          • For each experimental peak, uses the 1H positions to find all
             structural pairs within sqrt(tol1^2 + tol2^2), where tol1/tol2 come from tol_dict.
           • Ignores peaks near the diagonal (|F1–F2| < diagonal_tol).
           • Returns:
@@ -187,49 +194,83 @@ class RpfCalculator:
         connections = defaultdict(list)
         peak_assignments = defaultdict(list)
 
-        # 1) Build a list of 2D points (F1, F2) from shift_pairs
+        dims = spectrum.referenceExperimentDimensions
+        h_dim_indices = [i for i, dim in enumerate(dims, start=1) if dim.startswith('H')]
+        if len(h_dim_indices) < 2:
+            print("⚠️ Ambiguous NOE matching requires at least two 1H dimensions")
+            return connections, peak_assignments
+
+        h_dim1, h_dim2 = h_dim_indices[:2]
+
+        # 1) Build a list of 2D points (Hdim1, Hdim2) from shift_pairs
         points = []
         valid_pairs = []
         for pair in shift_pairs:
             try:
-                f1 = float(pair["F1_shift"])
-                f2 = float(pair["F2_shift"])
+                f1 = float(pair[f"F{h_dim1}_shift"])
+                f2 = float(pair[f"F{h_dim2}_shift"])
             except (KeyError, TypeError, ValueError):
-                # Skip if missing or non‐numeric F1/F2
+                # Skip if missing or non‐numeric H-dim shifts
                 print(pair)
                 continue
             points.append((f1, f2))
             valid_pairs.append(pair)
 
         if not points:
-            print("⚠️ No valid (F1, F2) shifts available for KDTree construction")
+            print("⚠️ No valid (H, H) shifts available for KDTree construction")
             return connections, peak_assignments
 
         points_arr = np.array(points)
         try:
-            # Use boxsize of [360,360] if you want ±180 ppm aliasing; omit boxsize if not needed
-            tree = KDTree(points_arr, boxsize=[360, 360])
+            # Use boxsize of [360,360] for ±180 ppm aliasing if enabled
+            if aliasing:
+                tree = KDTree(points_arr, boxsize=[360, 360])
+            else:
+                tree = KDTree(points_arr)
         except Exception as e:
             print(f"❌ KDTree creation failed: {e}")
             return connections, peak_assignments
+        onebond_pairs = []
+        for mt in spectrum.magnetisationTransfers:
+            if mt.transferType != 'onebond':
+                continue
+            d1 = dims[mt.dimension1 - 1]
+            d2 = dims[mt.dimension2 - 1]
+            if d1.startswith('H') and not d2.startswith('H'):
+                onebond_pairs.append((mt.dimension1, mt.dimension2))
+            elif d2.startswith('H') and not d1.startswith('H'):
+                onebond_pairs.append((mt.dimension2, mt.dimension1))
+        onebond_map = {h_dim: het_dim for h_dim, het_dim in onebond_pairs}
 
         # 2) Iterate over experimental peaks
         for _, peak in peak_df.iterrows():
-            # Skip if no F1 or F2 position
-            if pd.isna(peak.get("position_F1")) or pd.isna(peak.get("position_F2")):
+            # Skip if no 1H positions
+            if pd.isna(peak.get(f"position_F{h_dim1}")) or pd.isna(peak.get(f"position_F{h_dim2}")):
                 continue
 
-            pos1 = float(peak["position_F1"])
-            pos2 = float(peak["position_F2"])
+            pos1 = float(peak[f"position_F{h_dim1}"])
+            pos2 = float(peak[f"position_F{h_dim2}"])
 
-            # Exclude diagonal NOEs
+            # Exclude diagonal NOEs; for 3D/4D check hetero dims too
             if abs(pos1 - pos2) < diagonal_tol:
-                continue
+                dim_a = onebond_map.get(h_dim1)
+                dim_b = onebond_map.get(h_dim2)
+                if dim_a and dim_b:
+                    pos_a = peak.get(f"position_F{dim_a}")
+                    pos_b = peak.get(f"position_F{dim_b}")
+                    tol_a = tol_dict.get(dim_a, (0.0,))[0]
+                    tol_b = tol_dict.get(dim_b, (0.0,))[0]
+                    if pos_a is None or pos_b is None:
+                        continue
+                    if abs(float(pos_a) - float(pos_b)) < min(tol_a, tol_b):
+                        continue
+                else:
+                    continue
 
             # Determine per-dimension tolerances from tol_dict
             # tol_dict keys should be dimension indices: e.g. {1: (tol1, …), 2: (tol2, …), …}
-            tol1 = tol_dict.get(1, (0.0,))[0]
-            tol2 = tol_dict.get(2, (0.0,))[0]
+            tol1 = tol_dict.get(h_dim1, (0.0,))[0]
+            tol2 = tol_dict.get(h_dim2, (0.0,))[0]
             query_tol = np.sqrt(tol1**2 + tol2**2)
 
             # Query KDTree
@@ -241,8 +282,22 @@ class RpfCalculator:
             if not idxs:
                 continue
 
-            # Map matched indices back to valid_pairs
-            matched_pairs = [valid_pairs[i] for i in idxs]
+            # Map matched indices back to valid_pairs and filter by remaining dims
+            matched_pairs = []
+            for i in idxs:
+                sp = valid_pairs[i]
+                match_ok = True
+                for dim_index in range(1, len(dims) + 1):
+                    peak_pos = peak.get(f"position_F{dim_index}")
+                    shift_val = sp.get(f"F{dim_index}_shift")
+                    if peak_pos is None or shift_val is None:
+                        continue
+                    tol = tol_dict.get(dim_index, (0.0,))[0]
+                    if abs(float(peak_pos) - float(shift_val)) > tol:
+                        match_ok = False
+                        break
+                if match_ok:
+                    matched_pairs.append(sp)
 
             # Record connections and peak assignments
             for sp in matched_pairs:
@@ -254,6 +309,7 @@ class RpfCalculator:
 
 
     def get_chemicalShift_of_atom(self, atom):
+        # Retrieve the chemical shift value for a specific atom.
         model = self.ensembleModels[0]
         chainCode = atom.parent.parent.id  # Chain
         resiNum = atom.parent.id[1]  # Residue number
@@ -272,6 +328,7 @@ class RpfCalculator:
             return None, None
 
     def get_chemicalShift_of_attached_atom(self, atom):
+        # Retrieve the shift and element for the heavy atom attached to a proton.
         model = self.ensembleModels[0]
         chainCode = atom.parent.parent.id  # Chain
         resiNum = atom.parent.id[1]  # Residue number
@@ -416,7 +473,7 @@ class RpfCalculator:
             seen = set()
             filtered = []
             for entry in pairs:
-                key = (entry['atom1'], entry['atom2'])
+                key = (tuple(entry['atom1']), tuple(entry['atom2']))
                 if key not in seen:
                     seen.add(key)
                     filtered.append(entry)
@@ -938,9 +995,10 @@ class RpfCalculator:
             if key in shift_map:
                 shifts.append([key, shift_map[key]])
 
-        return shifts if shifts else [[None,None]]
+        return shifts
 
     def get_unique_pairs(self, pairs_list):
+        # Ensure proton pairs are treated as unordered, unique pairs.
         """Filter pairs to ensure uniqueness (A-B == B-A)"""
         seen = set()
         unique_pairs = []
@@ -972,6 +1030,7 @@ class RpfCalculator:
         return unique_pairs
 
     def get_valid_context_pairs(self, protons, contexts):
+        # Filter proton pairs by allowed bonding context.
         """With pair debugging"""
         valid_pairs = []
         model = self.ensembleModels[0]
@@ -1000,6 +1059,7 @@ class RpfCalculator:
         return valid_pairs
 
     def map_to_nmr_atoms(self, project: Project, pairs_list):
+        # Map PDB atom pairs to CCPN NmrAtom pairs with ambiguity handling.
         """Convert pairs to CCPN NmrAtom pairs with ambiguity handling"""
         # Precompute all NmrAtom PIDs
         pid_map = {atom.pid: atom for atom in project.nmrAtoms}
@@ -1048,11 +1108,13 @@ class RpfCalculator:
         return list(set(result))  # Remove duplicates
 
     def load_pdb_ensemble(self):
+        # Load the PDB ensemble from disk.
         """Load PDB file with potential multiple models"""
         parser = PDBParser(QUIET=True)
         return parser.get_structure("ensemble", self.pdb_path)
 
     def get_bound_protons(self, search_element = 'H', target_elements: list =[], bond_cutoff: float = 1.2):
+        # Find protons within bond distance of target elements.
         """Find protons bound to specified elements using spatial proximity"""
         model = self.ensembleModels[0]
         ns = NeighborSearch(list(model.get_atoms()))
@@ -1069,6 +1131,7 @@ class RpfCalculator:
         return protons
 
     def calculate_min_distance(self, pair, models):
+        # Calculate the minimum inter-proton distance across models.
         """Calculate minimum distance with proper error handling"""
         h1, h2 = pair
         min_dist = float('inf')
@@ -1094,6 +1157,7 @@ class RpfCalculator:
         return min_dist if min_dist != float('inf') else None
 
     def get_proton_pairs(self, distance_threshold: float, contexts: tuple, target_element: str):
+        # Build all proton pairs under the distance threshold with context checks.
         """Main function with debug prints"""
         print(f"⏳ Loading PDB ensemble from {self.pdb_path}")
         ensemble = self.ensemble
@@ -1133,6 +1197,7 @@ class RpfCalculator:
         return results
 
     def create_shift_map(self):
+        # Build a lookup table for chemical shifts keyed by atom identity.
         """Create a dictionary mapping atoms to their chemical shifts"""
         chemicalShift_list = self.project.getByPid(self.chemical_shift_pid)
         chemicalShift_list_df = chemicalShift_list.getAsDataFrame()
@@ -1258,12 +1323,23 @@ class RpfCalculator:
         atom1 = mapping[h_dims[0]][0] if len(h_dims) >= 1 and h_dims[0] in mapping else None
         atom2 = mapping[h_dims[1]][0] if len(h_dims) >= 2 and h_dims[1] in mapping else None
 
-        # 2) Identify hetero dims (non‐H)
+        # 2) Identify hetero dims (non‐H) and map them to the matching proton residue
         non_h_dims = [d for d in dims if not d.startswith('H')]
 
-        # Determine heteroKey1 by matching residue number to atom1
-        heteroKey1 = mapping[dims[2]][0] if len(dims) >= 3 else None
-        heteroKey2 = mapping[dims[3]][0] if len(dims) >= 4 else None
+        heteroKey1 = None
+        heteroKey2 = None
+        atom1_res_key = tuple(atom1[:3]) if atom1 else None
+        atom2_res_key = tuple(atom2[:3]) if atom2 else None
+
+        for dim_label in non_h_dims:
+            hetero_key = mapping.get(dim_label, [None, None])[0]
+            if not hetero_key:
+                continue
+            hetero_res_key = tuple(hetero_key[:3])
+            if atom1_res_key and hetero_res_key == atom1_res_key:
+                heteroKey1 = hetero_key
+            elif atom2_res_key and hetero_res_key == atom2_res_key:
+                heteroKey2 = hetero_key
 
         # 3) Build the F‐shift dictionary
         shifts = {}
@@ -1345,7 +1421,8 @@ class RpfCalculator:
             atom1_shift = None
             if len(possibleProton1_shifts) == 1:
                 atom1_shift = possibleProton1_shifts[0][1]
-                atom1_key[3] = possibleProton1_shifts[0][0][3] # set atom name to NMRatomName
+                if possibleProton1_shifts[0][0] is not None:
+                    atom1_key[3] = possibleProton1_shifts[0][0][3] # set atom name to NMRatomName
             elif len(possibleProton1_shifts) > 1:
                 print('likely assignment error', possibleProton1_shifts[0][1])
             else:
@@ -1355,7 +1432,8 @@ class RpfCalculator:
             #Out[127]: [[('A', 4, 'GLN', 'H'), 8.384]]
             if len(possibleProton2_shifts) == 1:
                 atom2_shift = possibleProton2_shifts[0][1]
-                atom2_key[3] = possibleProton2_shifts[0][0][3]  # set atom name to NMRatomName
+                if possibleProton2_shifts[0][0] is not None:
+                    atom2_key[3] = possibleProton2_shifts[0][0][3]  # set atom name to NMRatomName
             elif len(possibleProton2_shifts) > 1:
                 print('likely assingment error', possibleProton2_shifts[0][1])
             else:
@@ -1653,12 +1731,14 @@ class RpfCalculator:
         return merged_matched, merged_unexplained, merged_missing
 
     def get_chain(self):
+        # Resolve the structural chain associated with the chemical shifts.
         csl = self.project.getByPid(self.chemical_shift_pid)
         cs = csl.chemicalShifts[0]
         chain = cs.nmrAtom.nmrResidue.nmrChain.chain
         return chain
 
     def get_residueType_from_number(self, resiNum):
+        # Map a residue sequence number to its residue type.
         resiName = None
         chain = self.get_chain()
         for resi in chain:
@@ -1669,6 +1749,7 @@ class RpfCalculator:
         return resiName
 
     def create_synthetic_peaklist(self, peaklist_pid):
+        # Create a CCPN synthetic peak list for missing peaks.
         """Create CCPN PeakList for missing peaks"""
 
         pkl = self.project.getByPid(peaklist_pid)
@@ -1688,6 +1769,7 @@ class RpfCalculator:
                     )
 
     def run_rpf_analysis(self):
+        # Orchestrate the full RPF analysis workflow.
         # 1) Load data
         self.peaklists = self.getPeakList_objects()
         print(f"Loaded {len(self.peaklists)} peak lists")
@@ -1749,14 +1831,32 @@ class RpfCalculator:
             # 3d) Build a (dummy) tolerance dictionary
             # We'll still use get_ambig_noe_conn later, but for debugging, show it here
             tol_dict = {}
-            for dimObj in spectrum.dimensions:
-                # dimObj is a DataDim; assign a tuple for (tol, dummy)
-                tol_dict[dimObj] = (0.05, 0.05)
+            dims = spectrum.referenceExperimentDimensions
+            for i, dim_obj in enumerate(spectrum.dimensions, start=1):
+                dim_label = dims[i - 1] if i - 1 < len(dims) else ''
+                if dim_label.startswith('H'):
+                    default_tol = self.h_tolerance
+                elif dim_label.startswith('C'):
+                    default_tol = self.c_tolerance
+                elif dim_label.startswith('N'):
+                    default_tol = self.n_tolerance
+                else:
+                    default_tol = self.h_tolerance
+                tol_value = getattr(dim_obj, 'assignTolerance', default_tol)
+                if tol_value is None:
+                    tol_value = default_tol
+                # Use 1-based dimension index for F1/F2 lookup in get_ambig_noe_conn
+                tol_dict[i] = (tol_value, tol_value)
             print("Tolerance dictionary keys:", list(tol_dict.keys()))
 
             # 3e) Perform ambiguous NOE mapping (just to see connections)
             connections, peak_assignments = self.get_ambig_noe_conn(
-                    self.shift_pairs[pkl.pid], peak_df, tol_dict
+                    self.shift_pairs[pkl.pid],
+                    peak_df,
+                    tol_dict,
+                    spectrum,
+                    diagonal_tol=self.diagonal_tolerance,
+                    aliasing=self.aliasing,
                     )
             print(f"get_ambig_noe_conn → {len(connections)} distinct (atom1,atom2) keys")
             # Show a couple of keys:
@@ -1834,6 +1934,7 @@ from ccpn.ui.gui.widgets.Button import Button
 from ccpn.ui.gui.widgets.Label import Label
 from ccpn.ui.gui.widgets import MessageDialog
 from ccpn.ui.gui.widgets import Entry
+from ccpn.ui.gui.widgets import CheckBox
 from ccpn.ui.gui.widgets.FileDialog import OtherFileDialog
 from ccpn.ui.gui.widgets.Frame import Frame
 from ccpn.framework.Application import getApplication
@@ -1847,6 +1948,7 @@ class RpfGui(CcpnDialogMainWidget):
     title = 'RPF Analysis'
 
     def __init__(self, parent=None, mainWindow=None, title=title, **kwds):
+        # Initialize the RPF GUI dialog.
         super().__init__(parent, setLayout=True, windowTitle=title, **kwds)
         self.mainWindow = mainWindow
         self.application = getApplication()
@@ -1855,6 +1957,7 @@ class RpfGui(CcpnDialogMainWidget):
         self._createWidgets()
 
     def _createWidgets(self):
+        # Build the GUI widgets and layout.
         row = 0
         # PDB File Input
         Label(self.mainWidget, text="PDB File:", grid=(row, 0))
@@ -1872,6 +1975,19 @@ class RpfGui(CcpnDialogMainWidget):
         self.distTolerance = Entry.FloatEntry(
             self.mainWidget, grid=(row, 1), text=4.8
         )
+
+        row += 1
+        # Diagonal/prochiral/aliasing controls
+        Label(self.mainWidget, text="Diagonal Exclusion (PPM):", grid=(row, 0))
+        self.diagonalTolerance = Entry.FloatEntry(
+            self.mainWidget, grid=(row, 1), text=0.3
+        )
+        Label(self.mainWidget, text="Prochiral Exclusion (PPM):", grid=(row, 2))
+        self.prochiralTolerance = Entry.FloatEntry(
+            self.mainWidget, grid=(row, 3), text=0.04
+        )
+        Label(self.mainWidget, text="Aliasing:", grid=(row, 4))
+        self.aliasingCheckBox = CheckBox.CheckBox(self.mainWidget, grid=(row, 5), checked=True)
 
         row += 1
         # H / C / N tolerances grouped in a Frame
@@ -1916,6 +2032,7 @@ class RpfGui(CcpnDialogMainWidget):
         self._populateWidgets()
 
     def _populateWidgets(self):
+        # Populate UI widgets with project data.
         # Get NOESY PeakLists
         _peakLists = []
         for pkl in self.project.peakLists:
@@ -1926,6 +2043,7 @@ class RpfGui(CcpnDialogMainWidget):
         self.peakListWidget.setListObjects(_peakLists)
 
     def _browsePDB(self):
+        # Open a file dialog to select a PDB file.
         _currentPath = self.pdbLineEdit.getText()
         if _currentPath:
             _directory = aPath(_currentPath).parent.asString()
@@ -1943,6 +2061,7 @@ class RpfGui(CcpnDialogMainWidget):
             self.pdbLineEdit.setText(str(path))
 
     def _runAnalysis(self):
+        # Gather inputs and run the RPF calculation from the UI.
         pdb_path = self.pdbLineEdit.getText()
         if not pdb_path:
             MessageDialog.showWarning("No PDB File", "Please select a PDB file.")
@@ -1953,6 +2072,9 @@ class RpfGui(CcpnDialogMainWidget):
         project = self.project
 
         distance_threshold = float(self.distTolerance.getText())
+        diagonal_tol = float(self.diagonalTolerance.getText())
+        prochiral_tol = float(self.prochiralTolerance.getText())
+        aliasing = bool(self.aliasingCheckBox.get())
         h_tol = float(self.hTolerance.getText())
         c_tol = float(self.cTolerance.getText())
         n_tol = float(self.nTolerance.getText())
@@ -1964,9 +2086,12 @@ class RpfGui(CcpnDialogMainWidget):
             peak_list_pids=peak_list_pids,
             chemical_shift_pid=chemical_shift_pid,
             distance_threshold=distance_threshold,
+            prochiral_tolerance=prochiral_tol,
             h_tolerance=h_tol,
             c_tolerance=c_tol,
             n_tolerance=n_tol,
+            diagonal_tolerance=diagonal_tol,
+            aliasing=aliasing,
         )
 
         self.rpf_calc.run_rpf_analysis()
