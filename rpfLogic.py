@@ -1,13 +1,3 @@
-import pandas as pd
-import numpy as np
-import re
-from Bio.PDB import PDBParser, NeighborSearch
-from itertools import combinations, product
-from scipy.spatial.distance import cdist
-from ccpn.core.Project import Project
-from collections import defaultdict
-from scipy.spatial import KDTree
-
 """
  **Recall, Precision & F-Score; validating structures with peak lists**
 
@@ -47,6 +37,27 @@ from scipy.spatial import KDTree
  on information retrieval statistics. J Am Chem Soc 127, 1665-74 (2005)*
 
  """
+
+import re
+import traceback
+from collections import defaultdict
+from itertools import combinations, product
+
+import numpy as np
+import pandas as pd
+from Bio.PDB import NeighborSearch, PDBParser
+from ccpn.core.Project import Project
+from ccpn.framework.Application import getApplication
+from ccpn.ui.gui.popups.Dialog import CcpnDialogMainWidget
+from ccpn.ui.gui.widgets import CheckBox, Entry, MessageDialog
+from ccpn.ui.gui.widgets.Button import Button
+from ccpn.ui.gui.widgets.FileDialog import OtherFileDialog
+from ccpn.ui.gui.widgets.Frame import Frame
+from ccpn.ui.gui.widgets.Label import Label
+from ccpn.ui.gui.widgets.ListWidget import ListWidgetPair
+from ccpn.ui.gui.widgets.PulldownListsForObjects import ChemicalShiftListPulldown
+from ccpn.util.Path import aPath
+from scipy.spatial import KDTree
 
 
 class RpfCalculator:
@@ -186,11 +197,6 @@ class RpfCalculator:
               peak_assignments : dict mapping peak.serial → list of matching shift_pair dicts
         """
 
-        from scipy.spatial import KDTree
-        import numpy as np
-        import pandas as pd
-        from collections import defaultdict
-
         connections = defaultdict(list)
         peak_assignments = defaultdict(list)
 
@@ -205,13 +211,17 @@ class RpfCalculator:
         # 1) Build a list of 2D points (Hdim1, Hdim2) from shift_pairs
         points = []
         valid_pairs = []
+        skipped_pairs = 0
+        max_examples = 5
         for pair in shift_pairs:
             try:
                 f1 = float(pair[f"F{h_dim1}_shift"])
                 f2 = float(pair[f"F{h_dim2}_shift"])
             except (KeyError, TypeError, ValueError):
                 # Skip if missing or non‐numeric H-dim shifts
-                print(pair)
+                if skipped_pairs < max_examples:
+                    print(pair)
+                    skipped_pairs += 1
                 continue
             points.append((f1, f2))
             valid_pairs.append(pair)
@@ -240,7 +250,7 @@ class RpfCalculator:
                 onebond_pairs.append((mt.dimension1, mt.dimension2))
             elif d2.startswith('H') and not d1.startswith('H'):
                 onebond_pairs.append((mt.dimension2, mt.dimension1))
-        onebond_map = {h_dim: het_dim for h_dim, het_dim in onebond_pairs}
+        onebond_map = dict(onebond_pairs)
 
         # 2) Iterate over experimental peaks
         for _, peak in peak_df.iterrows():
@@ -301,7 +311,9 @@ class RpfCalculator:
 
             # Record connections and peak assignments
             for sp in matched_pairs:
-                key = (sp["atom1"], sp["atom2"])
+                atom1_key = tuple(sp["atom1"]) if sp.get("atom1") is not None else None
+                atom2_key = tuple(sp["atom2"]) if sp.get("atom2") is not None else None
+                key = (atom1_key, atom2_key)
                 connections[key].append(peak)
                 peak_assignments[peak["serial"]].append(sp)
 
@@ -324,19 +336,11 @@ class RpfCalculator:
             nmrAtom = self.project.getByPid(NmrAtomPID)
             chemicalShift = nmrAtom.chemicalShifts[0]
             return chemicalShift.value, NmrAtomPID
-        except:
+        except Exception:
             return None, None
 
     def get_chemicalShift_of_attached_atom(self, atom):
         # Retrieve the shift and element for the heavy atom attached to a proton.
-        model = self.ensembleModels[0]
-        chainCode = atom.parent.parent.id  # Chain
-        resiNum = atom.parent.id[1]  # Residue number
-        #atomName = atom.name  # Atom name
-        chain = model[chainCode]  # Get chain A
-        residue = chain[(" ", resiNum, " ")]  # (hetflag, seqnum, insertion_code)
-        resiName = residue.resname
-
         model = self.ensembleModels[0]
         ns = NeighborSearch(list(model.get_atoms()))
         h1_neighbors = ns.search(atom.coord, 1.2, level='A')
@@ -359,7 +363,7 @@ class RpfCalculator:
         # contexts = (('N', 'C'), ('N', 'C'))
 
         # Flatten and get unique elements
-        unique_elements = list(set([element for context in contexts for element in context]))
+        unique_elements = list({element for context in contexts for element in context})
 
         # find protons attached to the atoms in the contexts within a bond distance.
         # done like this as PDB contains no connectivity info
@@ -367,52 +371,53 @@ class RpfCalculator:
                                          target_elements=unique_elements,
                                          bond_cutoff=1.2)
 
+        if not protons:
+            return {}
+
+        ctx_map = {atom: self._get_atom_context(atom) for atom in protons}
+        atom_key_map = {}
+        proton_ids = []
+        for atom in protons:
+            atom_key_map[atom] = (
+                atom.parent.parent.id,
+                atom.parent.id[1],
+                atom.parent.resname,
+                atom.name
+            )
+            proton_ids.append((atom.parent.parent.id, atom.parent.id, atom.name))
+
         for model in self.ensembleModels:  # ACTUALLY ITERATE THROUGH MODELS
             # Get coordinates FOR THIS MODEL
             coords = []
-            for atom in protons:
-                # Get atom from current model using full_id
-                # Get hierarchy components from the original atom
-                chain_id = atom.parent.parent.id
-                residue_id = atom.parent.id
-                atom_name = atom.name
-
-                chain = model[chain_id]
-                residue = chain[residue_id]
-                model_atom = residue[atom_name]
+            valid_indices = []
+            for idx, (chain_id, residue_id, atom_name) in enumerate(proton_ids):
+                try:
+                    model_atom = model[chain_id][residue_id][atom_name]
+                except KeyError:
+                    continue
                 coords.append(model_atom.coord)
+                valid_indices.append(idx)
 
-            coords = np.array(coords)
-            dist_matrix = cdist(coords, coords)
-            #print(dist_matrix)
+            if len(coords) < 2:
+                continue
 
-            for i, j in combinations(range(len(protons)), 2):
-                if dist_matrix[i, j] > dist_threshold:
+            coords_arr = np.array(coords)
+            tree = KDTree(coords_arr)
+            for i, j in tree.query_pairs(r=dist_threshold):
+                idx_i = valid_indices[i]
+                idx_j = valid_indices[j]
+                a1 = protons[idx_i]
+                a2 = protons[idx_j]
+
+                ctx = (ctx_map.get(a1), ctx_map.get(a2))
+                if ctx not in contexts:
                     continue
 
-                a1, a2 = protons[i], protons[j]
-
-                ctx_a1 = self._get_atom_context(a1)
-                ctx_a2 = self._get_atom_context(a2)
-                ctx = (ctx_a1, ctx_a2)
-
-                if ctx in contexts:
-                    noe = dist_matrix[i, j]**self.NOE_POWER
-
-                    atom1_key = (
-                        a1.parent.parent.id,
-                        a1.parent.id[1],
-                        a1.parent.resname,
-                        a1.name
-                        )
-                    atom2_key = (
-                        a2.parent.parent.id,
-                        a2.parent.id[1],
-                        a2.parent.resname,
-                        a2.name
-                        )
-
-                    noe_dict[(a1, a2,atom1_key,atom2_key)] += noe
+                dist = np.linalg.norm(coords_arr[i] - coords_arr[j])
+                noe = dist**self.NOE_POWER
+                atom1_key = atom_key_map[a1]
+                atom2_key = atom_key_map[a2]
+                noe_dict[(a1, a2, atom1_key, atom2_key)] += noe
 
 
 
@@ -498,18 +503,18 @@ class RpfCalculator:
                 atom = entry.get(atom_key)
                 shift = entry.get(shift_key)
                 if atom and shift is not None:
-                key = tuple(atom[:3])  # Residue ID
+                    key = tuple(atom[:3])  # Residue ID
                     grouped[key].append((entry, atom[3], shift))  # (entry, atomName, shift)
 
             filtered = []
             for key, entries in grouped.items():
                 used = set()
                 entries.sort(key=lambda x: x[2])  # sort by shift value
-                for i, (entry_i, name_i, shift_i) in enumerate(entries):
+                for i, (entry_i, _, shift_i) in enumerate(entries):
                     if i in used:
                         continue
                     for j in range(i + 1, len(entries)):
-                        _, name_j, shift_j = entries[j]
+                        _, _, shift_j = entries[j]
                         if abs(shift_i - shift_j) < self.prochiral_tolerance:
                             used.add(j)  # mark as redundant
                     filtered.append(entry_i)
@@ -518,7 +523,8 @@ class RpfCalculator:
             for entry in pairs:
                 atom = entry.get(atom_key)
                 shift = entry.get(shift_key)
-                if atom is None or shift is None or atom[:3] not in grouped:
+                atom_key_tuple = tuple(atom[:3]) if atom is not None else None
+                if atom is None or shift is None or atom_key_tuple not in grouped:
                     filtered.append(entry)
 
             return filtered
@@ -701,8 +707,6 @@ class RpfCalculator:
 
         except Exception as e:
             print(f"❌ Error in generate_synthetic_peaks: {str(e)}")
-            import traceback
-
             traceback.print_exc()
             return pd.DataFrame()
 
@@ -713,15 +717,15 @@ class RpfCalculator:
 
         # Count true positives
         for match in matched:
-            res1 = match['best_match']['atom1'][:3]
-            res2 = match['best_match']['atom2'][:3]
+            res1 = tuple(match['best_match']['atom1'][:3])
+            res2 = tuple(match['best_match']['atom2'][:3])
             residue_scores[res1]['tp'] += 1
             residue_scores[res2]['tp'] += 1
 
         # Count false negatives
         for pair in shift_pairs:
-            res1 = pair['atom1'][:3]
-            res2 = pair['atom2'][:3]
+            res1 = tuple(pair['atom1'][:3])
+            res2 = tuple(pair['atom2'][:3])
             if not any(m['best_match'] == pair for m in matched):
                 residue_scores[res1]['fn'] += 1
                 residue_scores[res2]['fn'] += 1
@@ -801,15 +805,16 @@ class RpfCalculator:
                 true_pos[0] += 1
                 try:
                     true_pos_noe[0] += match.get('distance', 0)**self.NOE_POWER
-                except:
-                    true_pos_noe[0]
+                except Exception:
+                    pass
 
                 # Local count (1-3 bonds)
                 if 1 < match.get('bond_count', 0) < 4:
                     true_pos[1] += 1
                     try:
                         true_pos_noe[1] += match.get('distance', 0)**self.NOE_POWER
-                    except:true_pos_noe[1]
+                    except Exception:
+                        pass
 
                 # Free chain count
                 true_pos[2] += 1
@@ -850,8 +855,6 @@ class RpfCalculator:
 
         except Exception as e:
             print(f"❌ Critical error in calculate_rpf_metrics: {str(e)}")
-            import traceback
-
             traceback.print_exc()
             return {}
 
@@ -1008,19 +1011,6 @@ class RpfCalculator:
             a1 = pair[0]  # First atom in the pair
             a2 = pair[1]  # Second atom in the pair
 
-            # Get basic info from atom objects
-            a1_info = (
-                a1.parent.parent.id,  # Chain
-                a1.parent.id[1],  # Residue number
-                a1.name  # Atom name
-                )
-
-            a2_info = (
-                a2.parent.parent.id,
-                a2.parent.id[1],
-                a2.name
-                )
-
             key = frozenset({a1, a2})  # Order-agnostic
 
             if key not in seen:
@@ -1087,9 +1077,12 @@ class RpfCalculator:
             # Generate possible PIDs for each atom
             def get_possible_pids(chain, resnum, atom_name):
                 pids = []
-                for variant in self._pdbName_to_possible_NEF_names(atom_name):
+                resName = self.get_residueType_from_number(int(resnum))
+                residue_type = resName.upper() if resName else ""
+                for variant in self._pdbName_to_possible_NEF_names(
+                        atom_name, residue_type=residue_type
+                        ):
                     # CCPN PID format: NA:<chain>.<resnum>.<resname>.<atom>
-                    resName = self.get_residueType_from_number(int(resnum))
                     pid_pattern = f"NA:{chain}.{resnum}.{resName}.{variant}"
                     compiled = re.compile(pid_pattern.replace('.', r'\.').replace('*', '.*'))
                     pids.extend([pid for pid in pid_map if compiled.match(pid)])
@@ -1113,9 +1106,11 @@ class RpfCalculator:
         parser = PDBParser(QUIET=True)
         return parser.get_structure("ensemble", self.pdb_path)
 
-    def get_bound_protons(self, search_element = 'H', target_elements: list =[], bond_cutoff: float = 1.2):
+    def get_bound_protons(self, search_element='H', target_elements=None, bond_cutoff: float = 1.2):
         # Find protons within bond distance of target elements.
         """Find protons bound to specified elements using spatial proximity"""
+        if target_elements is None:
+            target_elements = []
         model = self.ensembleModels[0]
         ns = NeighborSearch(list(model.get_atoms()))
         protons = []
@@ -1143,8 +1138,7 @@ class RpfCalculator:
                 m_h2 = model[h2.parent.parent.id][h2.parent.id[1]][h2.name]  # Same residue assumption
 
                 dist = np.linalg.norm(m_h1.coord - m_h2.coord)
-                if dist < min_dist:
-                    min_dist = dist
+                min_dist = min(min_dist, dist)
 
             except KeyError as e:
                 print(
@@ -1182,7 +1176,7 @@ class RpfCalculator:
 
         results = []
         print(f"📏 Calculating distances across {len(models)} models...")
-        for i, pair in enumerate(valid_pairs):
+        for pair in valid_pairs:
             min_dist = self.calculate_min_distance(pair, models)
             if min_dist <= distance_threshold:
                 results.append({
@@ -1215,8 +1209,6 @@ class RpfCalculator:
             shift_map[key] = row['value']
 
         self.shift_map = shift_map
-
-    import re
 
     def get_unmatched_peaks_report(self, unexplained_peaks, missing_pairs):
         """Generate detailed report of unmatched peaks and missing pairs, handling 2D/3D/4D."""
@@ -1316,8 +1308,6 @@ class RpfCalculator:
             • heteroKey1 = hetero bound to atom1 (matched by residue), or None,
             • heteroKey2 = hetero bound to atom2, or None.
         """
-        ndim = len(dims)
-
         # 1) Identify H dims in order
         h_dims = [d for d in dims if d.startswith('H')]
         atom1 = mapping[h_dims[0]][0] if len(h_dims) >= 1 and h_dims[0] in mapping else None
@@ -1375,8 +1365,6 @@ class RpfCalculator:
         shift_pairs = []
 
         dims = spectrum.referenceExperimentDimensions
-        ndim = len(dims)
-
         # 1) Build a list of all onebond channels: [(Hdim_name, HetDim_name), ...]
         onebond_pairs = []
         for mt in spectrum.magnetisationTransfers:
@@ -1391,7 +1379,7 @@ class RpfCalculator:
             # else: ignore any (H,H) or (X,X) or through-space, etc.
         #print(onebond_pairs)
 
-        for (a1, a2, key1, key2), distance in proton_dists_conn.items():
+        for (a1, a2, _, _), distance in proton_dists_conn.items():
 
             atom1_key = [
                 a1.parent.parent.id,
@@ -1697,17 +1685,6 @@ class RpfCalculator:
         # Track unique identifiers
         seen_peaks = set()  # (spectrum_id, peak_id)
 
-        # Helper to get peak signature
-        def _get_peak_id(peak):
-            return
-
-        # Helper to get pair signature
-        def _get_pair_id(pair):
-            return tuple(sorted([
-                (pair['atom1']['chain'], pair['atom1']['resnum'], pair['atom1']['name']),
-                (pair['atom2']['chain'], pair['atom2']['resnum'], pair['atom2']['name'])
-                ]))
-
         # Process matched peaks
         for pl_pid in matched_dict:
             for m in matched_dict[pl_pid]:
@@ -1775,7 +1752,7 @@ class RpfCalculator:
         print(f"Loaded {len(self.peaklists)} peak lists")
 
         self.ensemble = self.load_pdb_ensemble()
-        self.ensembleModels = [model for model in self.ensemble]
+        self.ensembleModels = list(self.ensemble)
         print(f"PDB ensemble models: {len(self.ensembleModels)}")
 
         self.chain = self.get_chain()
@@ -1802,7 +1779,7 @@ class RpfCalculator:
                     )
             print(f"Found {len(proton_dists_conn)} structural proton–proton pairs")
             # Show a couple of entries:
-            for i, ((a1, a2, k1,k2), dist) in enumerate(proton_dists_conn.items()):
+            for i, ((a1, a2, _, _), dist) in enumerate(proton_dists_conn.items()):
                 if i >= 3:
                     break
                 key1 = (a1.parent.parent.id, a1.parent.id[1], a1.parent.resname, a1.name)
@@ -1850,7 +1827,7 @@ class RpfCalculator:
             print("Tolerance dictionary keys:", list(tol_dict.keys()))
 
             # 3e) Perform ambiguous NOE mapping (just to see connections)
-            connections, peak_assignments = self.get_ambig_noe_conn(
+            connections, _peak_assignments = self.get_ambig_noe_conn(
                     self.shift_pairs[pkl.pid],
                     peak_df,
                     tol_dict,
@@ -1927,22 +1904,6 @@ class RpfCalculator:
         self.metrics["overall"] = overall_metrics
 
 
-from ccpn.ui.gui.widgets.PulldownListsForObjects import ChemicalShiftListPulldown
-from ccpn.ui.gui.popups.Dialog import CcpnDialogMainWidget
-from ccpn.ui.gui.widgets.ListWidget import ListWidgetPair
-from ccpn.ui.gui.widgets.Button import Button
-from ccpn.ui.gui.widgets.Label import Label
-from ccpn.ui.gui.widgets import MessageDialog
-from ccpn.ui.gui.widgets import Entry
-from ccpn.ui.gui.widgets import CheckBox
-from ccpn.ui.gui.widgets.FileDialog import OtherFileDialog
-from ccpn.ui.gui.widgets.Frame import Frame
-from ccpn.framework.Application import getApplication
-from ccpn.util.Path import aPath
-
-import pandas as pd
-
-
 class RpfGui(CcpnDialogMainWidget):
     FIXEDWIDTH = True
     title = 'RPF Analysis'
@@ -1953,6 +1914,7 @@ class RpfGui(CcpnDialogMainWidget):
         self.mainWindow = mainWindow
         self.application = getApplication()
         self.project = self.application.project if self.application else None
+        self.rpf_calc = None
 
         self._createWidgets()
 
@@ -2135,8 +2097,5 @@ class RpfGui(CcpnDialogMainWidget):
 
 
 if __name__ == '__main__':
-    # from ccpn.ui.gui.widgets.Application import TestApplication
-    #
-    # app = TestApplication()
     popup = RpfGui()
     popup.exec_()
