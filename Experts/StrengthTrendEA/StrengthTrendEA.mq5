@@ -20,6 +20,10 @@ input double InpWeightM15 = 0.2;
 input int    InpStrengthLookback = 14;
 input int    InpStrengthATRPeriod = 14;
 input int    InpMaxCandidates = 3;
+input double InpDivMin = 0.9;
+input int    InpDivSlopeBars = 3;
+input double InpDivSlopeMin = 0.03;
+input double InpDivSlopeWeight = 4.0;
 
 input int    InpRegimeEMA = 50;
 input int    InpRegimeSlopeBars = 10;
@@ -221,7 +225,7 @@ void EvaluateEntries()
       double lots = g_risk.LotSizeByRisk(c.symbol,InpRiskPerTradePct,sl_dist);
       if(lots<=0) { g_log.LogEvent("ENTRY_VETO",c.symbol,"lot_zero"); continue; }
 
-      string cm = StringFormat("STE v0.1 div=%.2f",c.divergence);
+      string cm = StringFormat("STE v0.1 div=%.2f slope=%.3f",c.divergence,c.divergence_slope);
       if(g_trade_mng.OpenPosition(c.symbol,c.is_long,lots,sl,cm))
       {
          g_states[sidx].state=ST_IN_TRADE;
@@ -267,7 +271,7 @@ void OnTimer()
    {
       g_strength.Compute(InpStrengthLookback,InpStrengthATRPeriod,InpStrengthTF_H4,InpStrengthTF_H1,InpStrengthTF_M15,InpWeightH4,InpWeightH1,InpWeightM15);
       g_regime.Update(_Symbol,PERIOD_H1,InpRegimeEMA,InpRegimeSlopeBars,14,InpSlopeThresh,InpAtrRatioThresh,g_strength.Dispersion(),InpDispersionThresh);
-      g_strength.BuildCandidates(g_candidates,InpMaxCandidates,InpMaxSpreadPoints,0.8,PERIOD_H1);
+      g_strength.BuildCandidates(g_candidates,InpMaxCandidates,InpMaxSpreadPoints,0.8,PERIOD_H1,InpStrengthTF_H1,InpDivSlopeBars,InpStrengthLookback,InpStrengthATRPeriod,InpDivMin,InpDivSlopeMin,InpDivSlopeWeight);
       g_log.LogEvent("REGIME",_Symbol,g_regime.StateString()+" disp="+DoubleToString(g_strength.Dispersion(),2));
       if(InpSelfCheckMode) Print("[SelfCheck] Strength ranking: ",g_strength.RankingString()," regime=",g_regime.StateString());
    }

@@ -10,6 +10,7 @@ struct StrengthCandidate
    string strong_ccy;
    string weak_ccy;
    double divergence;
+   double divergence_slope;
    double score;
 };
 
@@ -54,7 +55,11 @@ private:
       return false;
    }
 
-   double CurrencyStrengthTF(const string currency, const ENUM_TIMEFRAMES tf, const int lookback, const int atr_period)
+   double CurrencyStrengthTFShift(const string currency,
+                                  const ENUM_TIMEFRAMES tf,
+                                  const int lookback,
+                                  const int atr_period,
+                                  const int shift)
    {
       double sum = 0.0;
       int count = 0;
@@ -63,8 +68,9 @@ private:
          string s = m_pairs[i];
          if(!SymbolInfoInteger(s,SYMBOL_EXIST)) continue;
          if(!SymbolSelect(s,true)) continue;
+
          MqlRates rates[];
-         int need = lookback + atr_period + 5;
+         int need = shift + lookback + atr_period + 5;
          if(CopyRates(s, tf, 0, need, rates) < need) continue;
          ArraySetAsSeries(rates,true);
 
@@ -72,15 +78,16 @@ private:
          if(hATR==INVALID_HANDLE) continue;
          double atrv[];
          ArraySetAsSeries(atrv,true);
-         if(CopyBuffer(hATR,0,0,3,atrv)<3)
+         if(CopyBuffer(hATR,0,0,shift+3,atrv)<shift+3)
          {
             IndicatorRelease(hATR);
             continue;
          }
          IndicatorRelease(hATR);
-         if(atrv[0] <= 0.0) continue;
 
-         double mom = (rates[0].close - rates[lookback].close) / atrv[0];
+         if(atrv[shift] <= 0.0) continue;
+
+         double mom = (rates[shift].close - rates[shift+lookback].close) / atrv[shift];
          string b,q;
          if(!PairCurrencies(s,b,q)) continue;
 
@@ -117,9 +124,9 @@ public:
    {
       for(int i=0;i<CURR_COUNT;i++)
       {
-         double s4 = CurrencyStrengthTF(m_currencies[i], tf_h4, lookback, atr_period);
-         double s1 = CurrencyStrengthTF(m_currencies[i], tf_h1, lookback, atr_period);
-         double sM = CurrencyStrengthTF(m_currencies[i], tf_m15, lookback, atr_period);
+         double s4 = CurrencyStrengthTFShift(m_currencies[i], tf_h4, lookback, atr_period, 0);
+         double s1 = CurrencyStrengthTFShift(m_currencies[i], tf_h1, lookback, atr_period, 0);
+         double sM = CurrencyStrengthTFShift(m_currencies[i], tf_m15, lookback, atr_period, 0);
          m_strength[i] = w_h4*s4 + w_h1*s1 + w_m15*sM;
       }
 
@@ -164,9 +171,18 @@ public:
       return out;
    }
 
-   int BuildCandidates(StrengthCandidate &out_candidates[], const int max_candidates,
-                       const int max_spread_points, const double atr_ratio_min,
-                       const ENUM_TIMEFRAMES confirm_tf)
+   int BuildCandidates(StrengthCandidate &out_candidates[],
+                       const int max_candidates,
+                       const int max_spread_points,
+                       const double atr_ratio_min,
+                       const ENUM_TIMEFRAMES confirm_tf,
+                       const ENUM_TIMEFRAMES slope_tf,
+                       const int slope_lookback_bars,
+                       const int strength_lookback,
+                       const int strength_atr_period,
+                       const double div_min,
+                       const double div_slope_min,
+                       const double div_slope_weight)
    {
       ArrayResize(out_candidates,0);
       string strongs[2] = {m_currencies[m_top_idx[0]], m_currencies[m_top_idx[1]]};
@@ -202,14 +218,24 @@ public:
             double atr_ratio = atrbuf[0] / atr_sma;
             if(atr_ratio < atr_ratio_min) continue;
 
+            double div_now = StrengthByCurrency(A)-StrengthByCurrency(B);
+            if(div_now < div_min) continue;
+
+            double a_prev = CurrencyStrengthTFShift(A,slope_tf,strength_lookback,strength_atr_period,slope_lookback_bars);
+            double b_prev = CurrencyStrengthTFShift(B,slope_tf,strength_lookback,strength_atr_period,slope_lookback_bars);
+            double div_prev = a_prev - b_prev;
+            double div_slope = (div_now - div_prev) / MathMax(1,slope_lookback_bars);
+            if(div_slope < div_slope_min) continue;
+
             int n=ArraySize(out_candidates);
             ArrayResize(out_candidates,n+1);
             out_candidates[n].symbol=chosen;
             out_candidates[n].is_long=is_long;
             out_candidates[n].strong_ccy=A;
             out_candidates[n].weak_ccy=B;
-            out_candidates[n].divergence = StrengthByCurrency(A)-StrengthByCurrency(B);
-            out_candidates[n].score = out_candidates[n].divergence - 0.02*spread + 0.2*atr_ratio;
+            out_candidates[n].divergence = div_now;
+            out_candidates[n].divergence_slope = div_slope;
+            out_candidates[n].score = div_now + div_slope_weight*div_slope - 0.02*spread + 0.2*atr_ratio;
          }
       }
 

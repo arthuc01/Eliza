@@ -5,6 +5,7 @@ A production-oriented MT5 Expert Advisor implementing a **strong-vs-weak currenc
 ## Strategy overview
 - **Strength engine** (H4/H1/M15 weighted) computes currency scores for USD, EUR, GBP, JPY, CHF, CAD, AUD, NZD.
 - Builds top-2 vs bottom-2 combinations and maps to tradable symbols.
+- Candidate ranking uses divergence level plus divergence slope (strengthening over recent H1 bars) to avoid late/stale entries.
 - **Regime detector** allows entries only when market is in TREND state, based on:
   - EMA(50) slope normalized by ATR
   - ATR ratio (ATR / ATR-SMA)
@@ -43,6 +44,7 @@ A production-oriented MT5 Expert Advisor implementing a **strong-vs-weak currenc
 ## Key inputs
 - `InpSymbolsForStrength`: comma-separated symbols used to compute currency strength (edit here to match broker symbols).
 - `InpWeightH4/H1/M15`: weighted blend for strength score.
+- `InpDivMin`, `InpDivSlopeBars`, `InpDivSlopeMin`, `InpDivSlopeWeight`: minimum divergence + strengthening filter and ranking boost for rising divergence.
 - `InpSlopeThresh`, `InpAtrRatioThresh`, `InpDispersionThresh`: regime thresholds.
 - `InpDistMin/InpDistMax`, `InpADRPctMax`, `InpMaxSpreadPoints`: anti-chase and execution filters.
 - `InpUseStructureSL`, `InpATRSLMult`: SL mode.
