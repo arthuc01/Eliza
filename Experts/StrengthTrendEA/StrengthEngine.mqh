@@ -38,6 +38,22 @@ private:
       return true;
    }
 
+   bool FindTradablePair(const string base_ccy, const string quote_ccy, string &chosen, bool &is_long) const
+   {
+      chosen="";
+      is_long=true;
+      for(int i=0;i<ArraySize(m_pairs);i++)
+      {
+         string s=m_pairs[i];
+         if(!SymbolInfoInteger(s,SYMBOL_EXIST)) continue;
+         string b,q;
+         if(!PairCurrencies(s,b,q)) continue;
+         if(b==base_ccy && q==quote_ccy) { chosen=s; is_long=true; return true; }
+         if(b==quote_ccy && q==base_ccy) { chosen=s; is_long=false; return true; }
+      }
+      return false;
+   }
+
    double CurrencyStrengthTF(const string currency, const ENUM_TIMEFRAMES tf, const int lookback, const int atr_period)
    {
       double sum = 0.0;
@@ -45,6 +61,7 @@ private:
       for(int i=0;i<ArraySize(m_pairs);i++)
       {
          string s = m_pairs[i];
+         if(!SymbolInfoInteger(s,SYMBOL_EXIST)) continue;
          if(!SymbolSelect(s,true)) continue;
          MqlRates rates[];
          int need = lookback + atr_period + 5;
@@ -160,13 +177,10 @@ public:
          for(int j=0;j<2;j++)
          {
             string A = strongs[i], B = weaks[j];
-            string direct = A+B;
-            string inverse = B+A;
             string chosen = "";
             bool is_long = true;
-            if(SymbolInfoInteger(direct, SYMBOL_SELECT) || SymbolSelect(direct,true)) { chosen=direct; is_long=true; }
-            else if(SymbolInfoInteger(inverse, SYMBOL_SELECT) || SymbolSelect(inverse,true)) { chosen=inverse; is_long=false; }
-            if(chosen=="") continue;
+            if(!FindTradablePair(A,B,chosen,is_long)) continue;
+            if(!SymbolSelect(chosen,true)) continue;
 
             long spread = SymbolInfoInteger(chosen, SYMBOL_SPREAD);
             if(spread > max_spread_points) continue;

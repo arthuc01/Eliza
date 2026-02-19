@@ -32,6 +32,23 @@ private:
    long m_magic;
    ManagedTrade m_book[];
 
+   bool IsValidSL(const string symbol, const bool is_long, const double new_sl) const
+   {
+      if(new_sl<=0.0) return false;
+      int digits=(int)SymbolInfoInteger(symbol,SYMBOL_DIGITS);
+      double point=SymbolInfoDouble(symbol,SYMBOL_POINT);
+      if(point<=0.0) return false;
+
+      double bid=SymbolInfoDouble(symbol,SYMBOL_BID);
+      double ask=SymbolInfoDouble(symbol,SYMBOL_ASK);
+      int stops_level=(int)SymbolInfoInteger(symbol,SYMBOL_TRADE_STOPS_LEVEL);
+      double min_dist=stops_level*point;
+
+      double sl_norm=NormalizeDouble(new_sl,digits);
+      if(is_long) return (sl_norm < (bid-min_dist));
+      return (sl_norm > (ask+min_dist));
+   }
+
    int FindIdx(const ulong ticket)
    {
       for(int i=0;i<ArraySize(m_book);i++) if(m_book[i].ticket==ticket) return i;
@@ -130,10 +147,13 @@ public:
          if(!m_book[idx].be_done && profit_r>=be_trigger_r)
          {
             double be = is_long ? (m_book[idx].entry + be_buffer_price) : (m_book[idx].entry - be_buffer_price);
-            if((is_long && (sl<be || sl==0.0)) || (!is_long && (sl>be || sl==0.0)))
+            int digits=(int)SymbolInfoInteger(symbol,SYMBOL_DIGITS);
+            double point=SymbolInfoDouble(symbol,SYMBOL_POINT);
+            be=NormalizeDouble(be,digits);
+            if((is_long && (sl<be-point || sl==0.0)) || (!is_long && (sl>be+point || sl==0.0)))
             {
-               m_trade.PositionModify(symbol, be, 0.0);
-               m_book[idx].be_done=true;
+               if(IsValidSL(symbol,is_long,be) && m_trade.PositionModify(symbol, be, 0.0))
+                  m_book[idx].be_done=true;
             }
          }
 
@@ -156,9 +176,15 @@ public:
                if(CopyBuffer(hATR,0,0,2,a)>=2)
                {
                   double trail = trail_k*a[0];
+                  int digits=(int)SymbolInfoInteger(symbol,SYMBOL_DIGITS);
+                  double point=SymbolInfoDouble(symbol,SYMBOL_POINT);
                   double new_sl = is_long ? (px-trail) : (px+trail);
-                  if((is_long && new_sl>sl) || (!is_long && (sl==0 || new_sl<sl)))
-                     m_trade.PositionModify(symbol,new_sl,0.0);
+                  new_sl=NormalizeDouble(new_sl,digits);
+                  if((is_long && new_sl>sl+point) || (!is_long && (sl==0 || new_sl<sl-point)))
+                  {
+                     if(IsValidSL(symbol,is_long,new_sl))
+                        m_trade.PositionModify(symbol,new_sl,0.0);
+                  }
                }
                IndicatorRelease(hATR);
             }
